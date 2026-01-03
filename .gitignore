@@ -384,6 +384,9 @@ FodyWeavers.xsd
 !.vscode/extensions.json
 *.code-workspace
 
+#jetbrains IDEs settings folder
+.idea/
+
 # Local History for Visual Studio Code
 .history/
 
