@@ -382,6 +382,7 @@ FodyWeavers.xsd
 !.vscode/tasks.json
 !.vscode/launch.json
 !.vscode/extensions.json
+!.vscode/csharp-devkit.json
 *.code-workspace
 
 #jetbrains IDEs settings folder
