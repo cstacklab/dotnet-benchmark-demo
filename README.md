@@ -116,6 +116,47 @@ Advanced scenario with 4 related tables and deep navigation properties:
 
 **Recommendation**: Use `AsSplitQuery()` when loading multiple levels of navigation properties with EF Core to avoid cartesian explosion overhead.
 
+### 5. Streaming vs Materialize Benchmarks (`StreamingVsMaterializeBenchmarks.cs`)
+
+Builds a per-day order summary over the `orders` table (50,000 rows) and compares two ways for a service to hand data to its consumer:
+
+- **Materialize (`ToListAsync`)** — the service returns `Task<List<Order>>`. Every row is loaded into one big list before aggregation starts, so peak live memory is the entire result set.
+- **Streaming (`AsAsyncEnumerable`)** — the service returns `IAsyncEnumerable<Order>` and the consumer walks it with `await foreach`. Because the SQL guarantees `ORDER BY order_date`, all rows for a day arrive together: when the date changes, the previous day is complete — aggregate the small buffer, clear it, move on.
+
+| Method | Mean | StdDev | Ratio | Gen0 | Gen1 | Gen2 | Allocated | Alloc Ratio |
+|--------|------|--------|-------|------|------|------|-----------|------------|
+| **Materialize_ToListAsync** | 31.01 ms | 0.97 ms | 1.00 | 2406 | 1125 | 562 | 18.03 MB | 1.00 |
+| **Streaming_AsAsyncEnumerable** | 31.21 ms | 2.38 ms | 1.01 | 2281 | 968 | 312 | 16.65 MB | 0.92 |
+
+**Key Learning**: total *allocated* memory is similar for both (every row is touched once either way). The win is in **peak retained memory** — the streaming version only ever holds one day's rows, so streamed entities die in Gen0 and the GC reclaims them continuously instead of holding the whole result set until the end. This is the pattern that turns an out-of-memory crash on large result sets into a flat, small memory profile, no matter how many rows the query returns.
+
+```csharp
+// OLD: "here is the whole basket, already filled"
+Task<List<Order>> GetOrdersMaterializedAsync() => query.ToListAsync();
+
+// NEW: "here is a belt; ask me for the next row when you're ready"
+IAsyncEnumerable<Order> GetOrdersStreamAsync() => query.AsAsyncEnumerable();
+```
+
+#### Peak retained-memory runner (`PeakMemoryRunner.cs`)
+
+`MemoryDiagnoser` reports *total allocated*, which is near-identical for both strategies. The number that actually differs — **peak retained (live) heap** — needs a different measurement: a background sampler polls `GC.GetTotalMemory(forceFullCollection: true)` every few milliseconds during the workload and records the maximum. Forcing a full blocking collection per sample means dead rows the streaming path already released are excluded, so only truly *rooted* memory is counted. Data comes from an in-memory sorted generator so the row count can be scaled arbitrarily (no database needed).
+
+```bash
+dotnet run -c Release                    # -> BenchmarkDotNet (time + GC + allocations)
+dotnet run -c Release -- peak            # -> peak retained-memory comparison (default 5000 x 40)
+dotnet run -c Release -- peak 20000 40   # -> peak comparison with custom rows/date and dates
+```
+
+Measured results:
+
+| Total rows | Materialize (old) | Streaming (new) |
+|-----------|------------------:|----------------:|
+| 200,000 | +48.0 MB | +1.0 MB |
+| 800,000 | +170.1 MB | +3.9 MB |
+
+**Key Learning**: the materialised list roots every row until the end, so peak retained memory grows **linearly with total rows** (4x rows → ~3.5x memory). The streaming path's peak only grows with the *largest single group* (one reporting date), so it stays flat no matter how long the history gets — this is the difference between an eventual out-of-memory crash and a bounded memory profile.
+
 ## 🗄️ Database Schema
 
 The `schema_complex.sql` initializes the following structure:
