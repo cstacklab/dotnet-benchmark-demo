@@ -118,24 +118,24 @@ Advanced scenario with 4 related tables and deep navigation properties:
 
 ### 5. Streaming vs Materialize Benchmarks (`StreamingVsMaterializeBenchmarks.cs`)
 
-Builds a per-**reporting-date** summary over the `orders` table (50,000 rows spread across 40 quarter-end reporting dates) and compares two ways for a service to hand data to its consumer:
+Builds a per-**reporting-date** summary over the dedicated `account_snapshots` table (5,000 accounts × 40 quarter-end reporting dates = 200,000 rows) and compares two ways for a service to hand data to its consumer:
 
-- **Materialize (`ToListAsync`)** — the service returns `Task<List<Order>>`. Every row is loaded into one big list before aggregation starts, so peak live memory is the entire result set.
-- **Streaming (`AsAsyncEnumerable`)** — the service returns `IAsyncEnumerable<Order>` and the consumer walks it with `await foreach`. The grouping key is the quarter-end reporting date (four per year), which is a monotonic function of the timestamp — so `ORDER BY order_date` guarantees all rows for a reporting date arrive together: when the reporting date changes, the previous period is complete — aggregate the small buffer, clear it, move on.
+- **Materialize (`ToListAsync`)** — the service returns `Task<List<AccountSnapshot>>`. Every row is loaded into one big list before aggregation starts, so peak live memory is the entire result set.
+- **Streaming (`AsAsyncEnumerable`)** — the service returns `IAsyncEnumerable<AccountSnapshot>` and the consumer walks it with `await foreach`. Because the SQL guarantees `ORDER BY reporting_date`, all rows for a reporting date arrive together: when the reporting date changes, the previous period is complete — aggregate the small buffer, clear it, move on.
 
 | Method | Mean | StdDev | Ratio | Gen0 | Gen1 | Gen2 | Allocated | Alloc Ratio |
 |--------|------|--------|-------|------|------|------|-----------|------------|
-| **Materialize_ToListAsync** | 33.91 ms | 0.59 ms | 1.00 | 2583 | 1083 | 417 | 18.3 MB | 1.00 |
-| **Streaming_AsAsyncEnumerable** | 22.01 ms | 0.30 ms | 0.65 | 1938 | 656 | **0** | 15.69 MB | 0.86 |
+| **Materialize_ToListAsync** | 77.94 ms | 0.48 ms | 1.00 | 7286 | 2857 | 1000 | 59.39 MB | 1.00 |
+| **Streaming_AsAsyncEnumerable** | 58.76 ms | 1.19 ms | 0.75 | 6111 | 2222 | **0** | 48.97 MB | 0.82 |
 
-**Key Learning**: total *allocated* memory is similar for both (every row is touched once either way). The win is in **object lifetime** — the streaming version only ever holds one reporting date's rows, so streamed entities die in Gen0 and never reach Gen2 (417 Gen2 collections → **zero**). Avoiding the giant list and the `GroupBy` dictionary also makes it **35% faster**. This is the pattern that turns an out-of-memory crash on large result sets into a flat, small memory profile, no matter how many rows the query returns.
+**Key Learning**: total *allocated* memory is similar for both (every row is touched once either way). The win is in **object lifetime** — the streaming version only ever holds one reporting date's rows, so streamed entities die in Gen0 and never reach Gen2 (1000 Gen2 collections → **zero**). Avoiding the giant list and the `GroupBy` dictionary also makes it **25% faster**. This is the pattern that turns an out-of-memory crash on large result sets into a flat, small memory profile, no matter how many rows the query returns.
 
 ```csharp
 // OLD: "here is the whole basket, already filled"
-Task<List<Order>> GetOrdersMaterializedAsync() => query.ToListAsync();
+Task<List<AccountSnapshot>> GetSnapshotsMaterializedAsync() => query.ToListAsync();
 
 // NEW: "here is a belt; ask me for the next row when you're ready"
-IAsyncEnumerable<Order> GetOrdersStreamAsync() => query.AsAsyncEnumerable();
+IAsyncEnumerable<AccountSnapshot> GetSnapshotsStreamAsync() => query.AsAsyncEnumerable();
 ```
 
 #### Peak retained-memory runner (`PeakMemoryRunner.cs`)
@@ -152,8 +152,8 @@ Measured results:
 
 | Total rows | Materialize (old) | Streaming (new) |
 |-----------|------------------:|----------------:|
-| 200,000 | +47.7 MB | +1.0 MB |
-| 800,000 | +170.1 MB | +3.9 MB |
+| 200,000 | +35.2 MB | +0.7 MB |
+| 800,000 | +121.5 MB | +2.7 MB |
 
 **Key Learning**: the materialised list roots every row until the end, so peak retained memory grows **linearly with total rows** (4x rows → ~3.5x memory). The streaming path's peak only grows with the *largest single group* (one reporting date), so it stays flat no matter how long the history gets — this is the difference between an eventual out-of-memory crash and a bounded memory profile.
 
@@ -166,6 +166,7 @@ users (id, name, email, age, created_at)
   ├── orders (id, user_id, order_date, total_amount, status)
   │   └── order_items (id, order_id, product_id, quantity, unit_price)
   │       └── products (id, name, price, category, stock)
+  └── account_snapshots (id, user_id, reporting_date, balance, invested_amount)
 ```
 
 **Data Population:**
@@ -173,6 +174,7 @@ users (id, name, email, age, created_at)
 - 500 products
 - 50,000 orders
 - 150,000 order items
+- 200,000 account snapshots (5,000 accounts × 40 quarter-end reporting dates, 2016-2025)
 
 ## 🐳 Docker Compose Commands
 

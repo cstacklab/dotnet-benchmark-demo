@@ -34,11 +34,22 @@ CREATE TABLE order_items (
     unit_price DECIMAL(10, 2) NOT NULL
 );
 
+-- Quarter-end account snapshots (for the streaming vs materialize benchmarks):
+-- one row per account per reporting date, aggregated into one summary per quarter
+CREATE TABLE account_snapshots (
+    id SERIAL PRIMARY KEY,
+    user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    reporting_date DATE NOT NULL,
+    balance DECIMAL(12, 2) NOT NULL,
+    invested_amount DECIMAL(12, 2) NOT NULL
+);
+
 -- Create indexes for better query performance
 CREATE INDEX idx_orders_user_id ON orders(user_id);
 CREATE INDEX idx_order_items_order_id ON order_items(order_id);
 CREATE INDEX idx_order_items_product_id ON order_items(product_id);
 CREATE INDEX idx_users_age ON users(age);
+CREATE INDEX idx_account_snapshots_reporting_date ON account_snapshots(reporting_date);
 
 -- Populate data
 INSERT INTO users (id, name, email, age)
@@ -63,11 +74,9 @@ SELECT
     (RANDOM() * 500)::INT
 FROM generate_series(1, 500) g;
 
-INSERT INTO orders (user_id, order_date, total_amount, status)
+INSERT INTO orders (user_id, total_amount, status)
 SELECT
     (RANDOM() * 9999 + 1)::INT,
-    -- spread orders across 10 years (~40 quarters) so per-reporting-date grouping is meaningful
-    TIMESTAMP '2016-01-01' + RANDOM() * (TIMESTAMP '2026-01-01' - TIMESTAMP '2016-01-01'),
     (RANDOM() * 5000)::DECIMAL,
     CASE (RANDOM() * 3)::INT
         WHEN 0 THEN 'pending'
@@ -83,4 +92,14 @@ SELECT
     (RANDOM() * 10 + 1)::INT,
     (RANDOM() * 1000)::DECIMAL
 FROM generate_series(1, 150000) g;
+
+-- 5,000 accounts x 40 quarter-end reporting dates (2016-2025) = 200,000 snapshots
+INSERT INTO account_snapshots (user_id, reporting_date, balance, invested_amount)
+SELECT
+    u,
+    (date_trunc('quarter', DATE '2016-01-01' + (q * INTERVAL '3 months')) + INTERVAL '3 months - 1 day')::DATE,
+    (RANDOM() * 100000)::DECIMAL(12, 2),
+    (RANDOM() * 50000)::DECIMAL(12, 2)
+FROM generate_series(0, 39) q
+CROSS JOIN generate_series(1, 5000) u;
 
