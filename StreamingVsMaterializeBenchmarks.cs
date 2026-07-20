@@ -1,18 +1,34 @@
 namespace BenchmarkingDemo;
 
-// Result of aggregating one day's worth of orders
-public record DailyOrderSummary(DateTime Date, int OrderCount, decimal TotalRevenue, decimal AverageOrderValue);
+// Result of aggregating one reporting date's worth of orders
+public record ReportingDateSummary(DateTime ReportingDate, int OrderCount, decimal TotalRevenue, decimal AverageOrderValue);
+
+public static class ReportingDates
+{
+    /// <summary>
+    /// Maps any timestamp to its quarter-end reporting date (four per year).
+    /// Monotonic in time, so rows sorted by order_date are also sorted by reporting date —
+    /// each reporting date arrives as one contiguous run.
+    /// </summary>
+    public static DateTime ToReportingDate(this DateTime date)
+    {
+        var quarterEndMonth = ((date.Month - 1) / 3) * 3 + 3;
+        return new DateTime(date.Year, quarterEndMonth, DateTime.DaysInMonth(date.Year, quarterEndMonth));
+    }
+}
 
 /// <summary>
-/// Materialize vs Streaming: builds a per-day summary over the orders table (50,000 rows).
+/// Materialize vs Streaming: builds a per-reporting-date (quarter-end) summary over the
+/// orders table (50,000 rows).
 ///
 /// Old way (Materialize): the service returns Task&lt;List&lt;Order&gt;&gt; via ToListAsync() —
 /// every row is held in memory at once before aggregation starts.
 ///
 /// New way (Streaming): the service returns IAsyncEnumerable&lt;Order&gt; via AsAsyncEnumerable() —
-/// rows flow one at a time. Because SQL guarantees ORDER BY order_date, all rows for a day
-/// arrive together, so the moment the date changes the previous day is complete: aggregate
-/// the small buffer, clear it, move on. Peak live memory is one day's rows instead of all 50,000.
+/// rows flow one at a time. Because SQL guarantees ORDER BY order_date, all rows for a
+/// reporting date arrive together, so the moment the reporting date changes the previous
+/// period is complete: aggregate the small buffer, clear it, move on. Peak live memory is
+/// one quarter's rows instead of all 50,000.
 ///
 /// Total allocated is similar for both (every row is touched once either way); the difference
 /// shows up in peak retained memory and GC generation counts — streamed rows die in Gen0.
@@ -65,51 +81,51 @@ public class StreamingVsMaterializeBenchmarks
     }
 
     [Benchmark(Baseline = true)]
-    public async Task<List<DailyOrderSummary>> Materialize_ToListAsync()
+    public async Task<List<ReportingDateSummary>> Materialize_ToListAsync()
     {
         var allOrders = await GetOrdersMaterializedAsync();
 
         return allOrders
-            .GroupBy(o => o.OrderDate.Date)
-            .Select(g => AggregateDay(g.Key, g.ToList()))
+            .GroupBy(o => o.OrderDate.ToReportingDate())
+            .Select(g => AggregateReportingDate(g.Key, g.ToList()))
             .ToList();
     }
 
     [Benchmark]
-    public async Task<List<DailyOrderSummary>> Streaming_AsAsyncEnumerable()
+    public async Task<List<ReportingDateSummary>> Streaming_AsAsyncEnumerable()
     {
-        List<Order> buffer = [];                // holds the current day only
-        DateTime? currentDate = null;
-        List<DailyOrderSummary> aggregated = [];
+        List<Order> buffer = [];                    // holds the current reporting date only
+        DateTime? currentReportingDate = null;
+        List<ReportingDateSummary> aggregated = [];
 
         await foreach (var order in GetOrdersStreamAsync())
         {
-            var orderDate = order.OrderDate.Date;
+            var reportingDate = order.OrderDate.ToReportingDate();
 
-            // A new date appeared — the previous day is complete (rows arrive sorted),
-            // so aggregate it and throw the old rows away.
-            if (buffer.Count > 0 && orderDate != currentDate)
+            // A new reporting date appeared — the previous period is complete (rows arrive
+            // sorted), so aggregate it and throw the old rows away.
+            if (buffer.Count > 0 && reportingDate != currentReportingDate)
             {
-                aggregated.Add(AggregateDay(currentDate!.Value, buffer));
+                aggregated.Add(AggregateReportingDate(currentReportingDate!.Value, buffer));
                 buffer.Clear();
             }
 
-            currentDate = orderDate;
+            currentReportingDate = reportingDate;
             buffer.Add(order);
         }
 
-        // The stream ended, but the last day is still in the buffer.
+        // The stream ended, but the last reporting date is still in the buffer.
         if (buffer.Count > 0)
         {
-            aggregated.Add(AggregateDay(currentDate!.Value, buffer));
+            aggregated.Add(AggregateReportingDate(currentReportingDate!.Value, buffer));
         }
 
         return aggregated;
     }
 
-    private static DailyOrderSummary AggregateDay(DateTime date, List<Order> orders)
+    private static ReportingDateSummary AggregateReportingDate(DateTime reportingDate, List<Order> orders)
     {
         var total = orders.Sum(o => o.TotalAmount);
-        return new DailyOrderSummary(date, orders.Count, total, total / orders.Count);
+        return new ReportingDateSummary(reportingDate, orders.Count, total, total / orders.Count);
     }
 }

@@ -2,27 +2,29 @@ namespace BenchmarkingDemo;
 
 /// <summary>
 /// Generates orders in reporting-date order, one at a time — an in-memory stand-in for
-/// EF Core's AsAsyncEnumerable() over a query with ORDER BY order_date. Being a generator,
-/// it lets the peak runner scale to arbitrary row counts without touching the database.
+/// EF Core's AsAsyncEnumerable() over a query with ORDER BY order_date. Each order is
+/// stamped with its quarter-end reporting date (four per year), and rows for the same
+/// reporting date arrive together. Being a generator, it lets the peak runner scale to
+/// arbitrary row counts without touching the database.
 /// </summary>
 public static class OrderDataGenerator
 {
-    public static async IAsyncEnumerable<Order> GenerateAsync(int rowsPerDate, int dates)
+    public static async IAsyncEnumerable<Order> GenerateAsync(int rowsPerReportingDate, int reportingDates)
     {
-        var baseDate = new DateTime(2026, 1, 1);
+        var firstPeriod = new DateTime(2016, 1, 1);
         var id = 0;
 
-        for (var d = 0; d < dates; d++)
+        for (var q = 0; q < reportingDates; q++)
         {
-            var date = baseDate.AddDays(d);
-            for (var r = 0; r < rowsPerDate; r++)
+            var reportingDate = firstPeriod.AddMonths(3 * q).ToReportingDate();
+            for (var r = 0; r < rowsPerReportingDate; r++)
             {
                 id++;
                 yield return new Order
                 {
                     Id = id,
                     UserId = r % 10_000,
-                    OrderDate = date,
+                    OrderDate = reportingDate,
                     TotalAmount = 10m + id % 500,
                     Status = "completed",
                 };
@@ -39,11 +41,11 @@ public static class OrderDataGenerator
 /// <summary>
 /// The two consumption strategies over the same sorted stream.
 /// </summary>
-public static class DailyOrderAggregators
+public static class ReportingDateAggregators
 {
     // OLD: drain the whole stream into one list first, then aggregate.
     // The list roots every row until the method returns.
-    public static async Task<List<DailyOrderSummary>> MaterializeAsync(
+    public static async Task<List<ReportingDateSummary>> MaterializeAsync(
         IAsyncEnumerable<Order> source, CancellationToken ct)
     {
         List<Order> allOrders = [];
@@ -53,45 +55,45 @@ public static class DailyOrderAggregators
         }
 
         return allOrders
-            .GroupBy(o => o.OrderDate.Date)
-            .Select(g => AggregateDay(g.Key, g.ToList()))
+            .GroupBy(o => o.OrderDate.ToReportingDate())
+            .Select(g => AggregateReportingDate(g.Key, g.ToList()))
             .ToList();
     }
 
-    // NEW: hold one day's rows at a time; aggregate and clear at each date boundary.
-    public static async Task<List<DailyOrderSummary>> StreamingAsync(
+    // NEW: hold one reporting date's rows at a time; aggregate and clear at each boundary.
+    public static async Task<List<ReportingDateSummary>> StreamingAsync(
         IAsyncEnumerable<Order> source, CancellationToken ct)
     {
         List<Order> buffer = [];
-        DateTime? currentDate = null;
-        List<DailyOrderSummary> aggregated = [];
+        DateTime? currentReportingDate = null;
+        List<ReportingDateSummary> aggregated = [];
 
         await foreach (var order in source.WithCancellation(ct))
         {
-            var orderDate = order.OrderDate.Date;
+            var reportingDate = order.OrderDate.ToReportingDate();
 
-            if (buffer.Count > 0 && orderDate != currentDate)
+            if (buffer.Count > 0 && reportingDate != currentReportingDate)
             {
-                aggregated.Add(AggregateDay(currentDate!.Value, buffer));
+                aggregated.Add(AggregateReportingDate(currentReportingDate!.Value, buffer));
                 buffer.Clear();
             }
 
-            currentDate = orderDate;
+            currentReportingDate = reportingDate;
             buffer.Add(order);
         }
 
         if (buffer.Count > 0)
         {
-            aggregated.Add(AggregateDay(currentDate!.Value, buffer));
+            aggregated.Add(AggregateReportingDate(currentReportingDate!.Value, buffer));
         }
 
         return aggregated;
     }
 
-    private static DailyOrderSummary AggregateDay(DateTime date, List<Order> orders)
+    private static ReportingDateSummary AggregateReportingDate(DateTime reportingDate, List<Order> orders)
     {
         var total = orders.Sum(o => o.TotalAmount);
-        return new DailyOrderSummary(date, orders.Count, total, total / orders.Count);
+        return new ReportingDateSummary(reportingDate, orders.Count, total, total / orders.Count);
     }
 }
 
@@ -107,22 +109,22 @@ internal static class PeakMemoryRunner
     // Sampling forces a full collection, so keep the interval large enough to limit perturbation.
     private const int SampleIntervalMilliseconds = 3;
 
-    public static void Run(int rowsPerDate, int dates)
+    public static void Run(int rowsPerReportingDate, int reportingDates)
     {
-        long totalRows = (long)rowsPerDate * dates;
+        long totalRows = (long)rowsPerReportingDate * reportingDates;
 
-        Console.WriteLine($"Rows/date = {rowsPerDate:N0}   Dates = {dates}   Total rows = {totalRows:N0}");
+        Console.WriteLine($"Rows/reporting date = {rowsPerReportingDate:N0}   Reporting dates = {reportingDates}   Total rows = {totalRows:N0}");
         Console.WriteLine("(peak = maximum live/retained managed heap during the call)");
         Console.WriteLine();
 
         Measure("Materialize (old)", () =>
-            DailyOrderAggregators.MaterializeAsync(
-                OrderDataGenerator.GenerateAsync(rowsPerDate, dates),
+            ReportingDateAggregators.MaterializeAsync(
+                OrderDataGenerator.GenerateAsync(rowsPerReportingDate, reportingDates),
                 CancellationToken.None));
 
         Measure("Streaming (new)", () =>
-            DailyOrderAggregators.StreamingAsync(
-                OrderDataGenerator.GenerateAsync(rowsPerDate, dates),
+            ReportingDateAggregators.StreamingAsync(
+                OrderDataGenerator.GenerateAsync(rowsPerReportingDate, reportingDates),
                 CancellationToken.None));
     }
 
