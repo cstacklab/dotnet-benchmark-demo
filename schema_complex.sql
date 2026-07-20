@@ -63,9 +63,11 @@ SELECT
     (RANDOM() * 500)::INT
 FROM generate_series(1, 500) g;
 
-INSERT INTO orders (user_id, total_amount, status)
+INSERT INTO orders (user_id, order_date, total_amount, status)
 SELECT
     (RANDOM() * 9999 + 1)::INT,
+    -- spread orders across 10 years (~40 quarters) so per-reporting-date grouping is meaningful
+    TIMESTAMP '2016-01-01' + RANDOM() * (TIMESTAMP '2026-01-01' - TIMESTAMP '2016-01-01'),
     (RANDOM() * 5000)::DECIMAL,
     CASE (RANDOM() * 3)::INT
         WHEN 0 THEN 'pending'
