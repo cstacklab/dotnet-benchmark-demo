@@ -1,32 +1,31 @@
 namespace BenchmarkingDemo;
 
 /// <summary>
-/// Generates orders in reporting-date order, one at a time — an in-memory stand-in for
-/// EF Core's AsAsyncEnumerable() over a query with ORDER BY order_date. Each order is
-/// stamped with its quarter-end reporting date (four per year), and rows for the same
-/// reporting date arrive together. Being a generator, it lets the peak runner scale to
-/// arbitrary row counts without touching the database.
+/// Generates account snapshots in reporting-date order, one at a time — an in-memory
+/// stand-in for EF Core's AsAsyncEnumerable() over a query with ORDER BY reporting_date.
+/// Rows for the same reporting date arrive together. Being a generator, it lets the peak
+/// runner scale to arbitrary row counts without touching the database.
 /// </summary>
-public static class OrderDataGenerator
+public static class AccountSnapshotGenerator
 {
-    public static async IAsyncEnumerable<Order> GenerateAsync(int rowsPerReportingDate, int reportingDates)
+    public static async IAsyncEnumerable<AccountSnapshot> GenerateAsync(int rowsPerReportingDate, int reportingDates)
     {
-        var firstPeriod = new DateTime(2016, 1, 1);
+        var firstQuarterStart = new DateTime(2016, 1, 1);
         var id = 0;
 
         for (var q = 0; q < reportingDates; q++)
         {
-            var reportingDate = firstPeriod.AddMonths(3 * q).ToReportingDate();
+            var reportingDate = firstQuarterStart.AddMonths(3 * (q + 1)).AddDays(-1); // quarter end
             for (var r = 0; r < rowsPerReportingDate; r++)
             {
                 id++;
-                yield return new Order
+                yield return new AccountSnapshot
                 {
                     Id = id,
                     UserId = r % 10_000,
-                    OrderDate = reportingDate,
-                    TotalAmount = 10m + id % 500,
-                    Status = "completed",
+                    ReportingDate = reportingDate,
+                    Balance = 1000m + id % 100_000,
+                    InvestedAmount = 500m + id % 50_000,
                 };
 
                 if (id % 1000 == 0)
@@ -46,40 +45,38 @@ public static class ReportingDateAggregators
     // OLD: drain the whole stream into one list first, then aggregate.
     // The list roots every row until the method returns.
     public static async Task<List<ReportingDateSummary>> MaterializeAsync(
-        IAsyncEnumerable<Order> source, CancellationToken ct)
+        IAsyncEnumerable<AccountSnapshot> source, CancellationToken ct)
     {
-        List<Order> allOrders = [];
-        await foreach (var order in source.WithCancellation(ct))
+        List<AccountSnapshot> allSnapshots = [];
+        await foreach (var snapshot in source.WithCancellation(ct))
         {
-            allOrders.Add(order);
+            allSnapshots.Add(snapshot);
         }
 
-        return allOrders
-            .GroupBy(o => o.OrderDate.ToReportingDate())
+        return allSnapshots
+            .GroupBy(s => s.ReportingDate)
             .Select(g => AggregateReportingDate(g.Key, g.ToList()))
             .ToList();
     }
 
     // NEW: hold one reporting date's rows at a time; aggregate and clear at each boundary.
     public static async Task<List<ReportingDateSummary>> StreamingAsync(
-        IAsyncEnumerable<Order> source, CancellationToken ct)
+        IAsyncEnumerable<AccountSnapshot> source, CancellationToken ct)
     {
-        List<Order> buffer = [];
+        List<AccountSnapshot> buffer = [];
         DateTime? currentReportingDate = null;
         List<ReportingDateSummary> aggregated = [];
 
-        await foreach (var order in source.WithCancellation(ct))
+        await foreach (var snapshot in source.WithCancellation(ct))
         {
-            var reportingDate = order.OrderDate.ToReportingDate();
-
-            if (buffer.Count > 0 && reportingDate != currentReportingDate)
+            if (buffer.Count > 0 && snapshot.ReportingDate != currentReportingDate)
             {
                 aggregated.Add(AggregateReportingDate(currentReportingDate!.Value, buffer));
                 buffer.Clear();
             }
 
-            currentReportingDate = reportingDate;
-            buffer.Add(order);
+            currentReportingDate = snapshot.ReportingDate;
+            buffer.Add(snapshot);
         }
 
         if (buffer.Count > 0)
@@ -90,10 +87,13 @@ public static class ReportingDateAggregators
         return aggregated;
     }
 
-    private static ReportingDateSummary AggregateReportingDate(DateTime reportingDate, List<Order> orders)
+    private static ReportingDateSummary AggregateReportingDate(DateTime reportingDate, List<AccountSnapshot> snapshots)
     {
-        var total = orders.Sum(o => o.TotalAmount);
-        return new ReportingDateSummary(reportingDate, orders.Count, total, total / orders.Count);
+        return new ReportingDateSummary(
+            reportingDate,
+            snapshots.Count,
+            snapshots.Sum(s => s.Balance),
+            snapshots.Sum(s => s.InvestedAmount));
     }
 }
 
@@ -119,12 +119,12 @@ internal static class PeakMemoryRunner
 
         Measure("Materialize (old)", () =>
             ReportingDateAggregators.MaterializeAsync(
-                OrderDataGenerator.GenerateAsync(rowsPerReportingDate, reportingDates),
+                AccountSnapshotGenerator.GenerateAsync(rowsPerReportingDate, reportingDates),
                 CancellationToken.None));
 
         Measure("Streaming (new)", () =>
             ReportingDateAggregators.StreamingAsync(
-                OrderDataGenerator.GenerateAsync(rowsPerReportingDate, reportingDates),
+                AccountSnapshotGenerator.GenerateAsync(rowsPerReportingDate, reportingDates),
                 CancellationToken.None));
     }
 
